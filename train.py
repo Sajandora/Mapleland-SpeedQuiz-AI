@@ -71,7 +71,7 @@ def soft_ce(logits, soft_targets):
 # ───── main ─────────────────────────────────────────────
 def main():
     BASE  = os.path.dirname(os.path.abspath(__file__))
-    DATA  = os.path.join(BASE, "img")
+    DATA  = os.path.join(BASE, "util/img")
     SAVE  = os.path.join(BASE, "converted_savedmodel_resnet50")
     os.makedirs(SAVE, exist_ok=True)
     MODEL = os.path.join(SAVE, "model.pt")
