@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+speedquiz_overlay.py – PyTorch edition
+─────────────────────────────────────────────────────────────
+• 드래그 ROI → 빨간 실선 오버레이(click-through)
+• EfficientNet-B3(PyTorch) 분류 + answers.json 매핑
+• 실행 한 번으로 ROI 화면 변화 0.8 s 간격 추적
+─────────────────────────────────────────────────────────────
+"""
+
+# -----------------------------------------------------------
+# 1. 라이브러리
+# -----------------------------------------------------------
+import time, json, ctypes, numpy as np, pyautogui, pygetwindow as gw
+import tkinter as tk
+from tkinter import ttk, messagebox
+from PIL import Image, ImageOps
+import torch
+import timm
+from torchvision import transforms
+import sys, os
+
+# -----------------------------------------------------------
+# 2. 유틸리티
+# -----------------------------------------------------------
+def resource_path(relative_path):
+    """ PyInstaller로 패킹된 리소스 경로를 반환 """
+    try:
+        base_path = sys._MEIPASS
+    except AttributeError:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+# -----------------------------------------------------------
+# 3. 설정
+# -----------------------------------------------------------
+MODEL_PATH        = resource_path("converted_savedmodel_resnet/model.pt")
+LABELS_PATH       = resource_path("converted_savedmodel_resnet/labels.txt")
+ANS_JSON_PATH     = resource_path("answers.json")
+
+CAPTURE_INTERVAL  = 800         # ms
+ROI_COLOR         = "red"
+ROI_WIDTH         = 2           # px
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# -----------------------------------------------------------
+# 4. 전역 상태
+# -----------------------------------------------------------
+ROI       = None         # (x, y, w, h)
+OVERLAYS  = []           # 테두리 Toplevel 창 4 개
+RUNNING   = False
+TEST_MODE = False
+
+# -----------------------------------------------------------
+# 5. 모델 · 라벨 매핑
+# -----------------------------------------------------------
+labels = [ln.strip() for ln in open(LABELS_PATH, encoding="utf-8")]
+num_classes = len(labels)
+
+# timm 모델 생성 후 학습 가중치 로드
+model = timm.create_model("tf_efficientnet_b3",
+                          pretrained=False,
+                          num_classes=num_classes).to(DEVICE)
+state = torch.load(MODEL_PATH, map_location=DEVICE)
+model.load_state_dict(state)
+model.eval()
+
+# torchvision 전처리 (EfficientNet과 동일한 -1~1 스케일)
+tfm = transforms.Compose([
+    transforms.Resize((300, 300)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5]*3, [0.5]*3)
+])
+
+with open(ANS_JSON_PATH, encoding="utf-8") as f:
+    ans_map = {item["img"]: item["answer"] for item in json.load(f)}
+
+def id2answer(lbl: str) -> str:
+    try:
+        return ans_map.get(int(lbl), lbl)
+    except ValueError:
+        return lbl
+
+# -----------------------------------------------------------
+# 6. Win32 헬퍼 (click-through)
+# -----------------------------------------------------------
+def make_clickthrough(hwnd):
+    GWL_EXSTYLE      = -20
+    WS_EX_LAYERED    = 0x80000
+    WS_EX_TRANSPARENT = 0x20
+    style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+    style |= WS_EX_LAYERED | WS_EX_TRANSPARENT
+    ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+
+# -----------------------------------------------------------
+# 7. 테두리 오버레이
+# -----------------------------------------------------------
+def show_overlay():
+    global OVERLAYS
+    hide_overlay()
+    if ROI is None:
+        return
+    x, y, w, h = ROI
+    borders = []
+    for bx, by, bw, bh in [
+        (x,           y,            w, ROI_WIDTH),          # top
+        (x,           y+h-ROI_WIDTH, w, ROI_WIDTH),         # bottom
+        (x,           y,            ROI_WIDTH, h),          # left
+        (x+w-ROI_WIDTH, y,          ROI_WIDTH, h)           # right
+    ]:
+        tl = tk.Toplevel()
+        tl.overrideredirect(True)
+        tl.geometry(f"{bw}x{bh}+{bx}+{by}")
+        tl.configure(bg=ROI_COLOR)
+        tl.attributes("-topmost", True)
+        make_clickthrough(ctypes.windll.user32.GetParent(tl.winfo_id()))
+        borders.append(tl)
+    OVERLAYS = borders
+
+def hide_overlay():
+    global OVERLAYS
+    for w in OVERLAYS:
+        w.destroy()
+    OVERLAYS = []
+
+# -----------------------------------------------------------
+# 8. ROI 드래그 선택
+# -----------------------------------------------------------
+def select_roi_overlay():
+    over = tk.Toplevel()
+    over.attributes("-fullscreen", True)
+    over.attributes("-alpha", 0.3)
+    over.configure(bg="black")
+    over.attributes("-topmost", True)
+    cv = tk.Canvas(over, cursor="cross", bg="black")
+    cv.pack(fill="both", expand=True)
+
+    data = {"rect": None, "x": 0, "y": 0}
+    def press(e):
+        data["x"], data["y"] = e.x_root, e.y_root
+        data["rect"] = cv.create_rectangle(data["x"], data["y"],
+                                           data["x"], data["y"],
+                                           outline="cyan", width=2)
+    def drag(e):
+        if data["rect"]:
+            cv.coords(data["rect"], data["x"], data["y"], e.x_root, e.y_root)
+    def release(e):
+        global ROI
+        x1, y1 = data["x"], data["y"]
+        x2, y2 = e.x_root, e.y_root
+        ROI = (min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
+        over.destroy()
+        show_overlay()
+
+    cv.bind("<ButtonPress-1>", press)
+    cv.bind("<B1-Motion>", drag)
+    cv.bind("<ButtonRelease-1>", release)
+    over.mainloop()
+
+# -----------------------------------------------------------
+# 9. 캡처 & 예측
+# -----------------------------------------------------------
+def capture_roi():
+    if ROI is None:
+        raise RuntimeError("ROI가 정의되지 않았습니다.")
+    x, y, w, h = ROI
+    full = pyautogui.screenshot(region=(x, y, w, h))
+    return full.crop((ROI_WIDTH, ROI_WIDTH, w - ROI_WIDTH, h - ROI_WIDTH))
+
+@torch.no_grad()
+def predict(img: Image.Image):
+    img = ImageOps.fit(img, (300, 300), Image.Resampling.LANCZOS)
+    x = tfm(img).unsqueeze(0).to(DEVICE)
+    prob = torch.softmax(model(x), dim=1)[0]
+    idx = int(prob.argmax())
+    return id2answer(labels[idx]), float(prob[idx])
+
+# -----------------------------------------------------------
+# 10. GUI + 루프
+# -----------------------------------------------------------
+def gui_app():
+    root = tk.Tk()
+    root.title("SpeedQuiz Solver (Overlay)")
+    root.resizable(False, False)
+
+    def btn_set_roi():
+        title = combo.get().strip()
+        if title:
+            wins = gw.getWindowsWithTitle(title)
+            if wins:
+                wins[0].activate()
+                time.sleep(0.3)
+        messagebox.showinfo("영역 지정", "드래그하여 ROI를 선택하세요.")
+        select_roi_overlay()
+
+    def loop():
+        if not RUNNING:
+            return
+        try:
+            img = capture_roi()
+            ans, conf = predict(img)
+            status.set(f"{ans}  ({conf:.2f})")
+        except Exception as e:
+            status.set(f"⚠ {e}")
+        root.after(CAPTURE_INTERVAL, loop)
+
+    def start_live():
+        global RUNNING, TEST_MODE
+        if ROI is None:
+            messagebox.showwarning("!", "ROI를 먼저 지정하세요.")
+            return
+        RUNNING, TEST_MODE = True, False
+        loop()
+
+    def start_test():
+        global RUNNING, TEST_MODE
+        RUNNING, TEST_MODE = True, True
+        loop()
+
+    def stop_loop():
+        global RUNNING
+        RUNNING = False
+        status.set("⏹ 중지됨")
+
+    tk.Label(root, text="창 선택 ➜ [영역 지정] ➜ [실행]").pack(pady=4)
+
+    combo = ttk.Combobox(root, width=60,
+        values=[w.title for w in gw.getAllWindows() if w.title.strip()])
+    combo.pack(pady=2)
+    if combo["values"]:
+        combo.set(combo["values"][0])
+
+    btn_fr = tk.Frame(root)
+    btn_fr.pack(pady=6)
+    tk.Button(btn_fr, text="영역 지정", width=11,
+              command=btn_set_roi).grid(row=0, column=0, padx=3)
+    tk.Button(btn_fr, text="실행", width=11,
+              command=start_live).grid(row=0, column=1, padx=3)
+    tk.Button(btn_fr, text="테스트", width=11,
+              command=start_test).grid(row=0, column=2, padx=3)
+    tk.Button(btn_fr, text="중지", width=11,
+              command=stop_loop).grid(row=0, column=3, padx=3)
+
+    status = tk.StringVar(value="대기 중")
+    tk.Label(root, textvariable=status, font=("맑은 고딕", 14)).pack(pady=8)
+    root.mainloop()
+
+# -----------------------------------------------------------
+if __name__ == "__main__":
+    gui_app()
